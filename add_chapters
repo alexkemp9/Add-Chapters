@@ -1,0 +1,467 @@
+#!/bin/bash
+# add_chapters: Add a set of Chapters to a mp4 movie
+# 2021-11-13 added -force_key_frames
+
+set -eo pipefail
+shopt -s expand_aliases
+alias ffmpeg='ffmpeg -hide_banner'
+alias Reset="tput sgr0" # Reset text attributes to normal, not clearing screen
+
+CHAPTER='chapters.txt'  # plain-text listing of times + chapter titles
+CONVERT='helper.py'     # python script to convert CHAPTER to chapter-metadata
+DIR=""                  # dir that MP4NAME sits in
+FN="";                  # mp4 basename without '.mp4' extension
+MDATA='FFMETADATAFILE'  # file that contains mp4 metadata
+MP4=""                  # mp4 basename
+UPDATE="";              # mp4 with added chapters = "$FN-chapters.mp4"
+
+# list of internal functions:
+# CECHO()               # echo in magenta
+# CONVERTER ()          # creates $DIR/$CONVERT
+# HELP()                # prints out help
+
+HELP ()
+{
+cat << EOF
+
+usage: $0 MP4NAME -ACTION
+
+Adds a set of Chapters to a MP4 video.
+
+   MP4NAME     mp4 filename
+ACTIONs:
+   -a ADD      Add chapter metadata from “$CHAPTER” to “$MDATA”
+               note 1: if “$CONVERT” is missing it will be auto-created
+               note 2: ‘python 3’ is required to be installed
+   -c CREATE   Create python script “$CONVERT” in mp4 directory
+               note 2: ‘python 3’ is required to be installed
+   -e EXPORT   Export “$MDATA” (text file) from MP4NAME into same directory
+   (default)   note 3: ‘ffmpeg’ is required to be installed
+   -h HELP     Show this Help
+   -i IMPORT   Import “$MDATA” (text file) into MP4NAME
+               Note 3: ‘ffmpeg’ is required to be installed
+
+WORKFLOW:
+# https://ffmpeg.org/ffmpeg-formats.html#Metadata-1
+# https://ikyle.me/blog/2020/add-mp4-chapters-ffmpeg
+In brief:
+  a) Put a chapter-free MP4 into a directory
+  b) -e EXPORT the metadata from that mp4
+  c) Create “$CHAPTER” (lines of chapter start-time + title)
+  d) -a ADD the chapters from (c) into (b)
+  e) -i IMPORT the chapters (new metadata) from (d) into the mp4
+
+At dreadful length:
+  1) Place a chapter-free MP4 into a directory
+  2) -e EXPORT “$MDATA” (metadata) text-file from MP4
+  3) Check that there are no Chapters in “$MDATA”
+  4) (optional) Add/edit Global metadata in “$MDATA”
+eg:
+title=Groundhog Day
+artist=Harold Ramis
+date=1993
+
+note:
+     • In all Metadata, empty lines and lines starting with ‘;’ or ‘#’ are ignored
+     • Metadata keys or values containing special characters (‘=’, ‘;’, ‘#’, ‘\’
+       and a newline) must be escaped with a backslash ‘\’.
+     • Whitespace in metadata (e.g. ‘foo = bar’) is considered to be a part of the tag
+       (in example key is ‘foo ’, value is ‘ bar’)
+
+  5) (manual) Create file “$CHAPTER” containing only each chapter start-time +
+              title, ended by a dummy “END” chapter
+              (maintain a rigid format: “<hh:mm:ss><single-space><Chapter-Title>”)
+eg:
+00:00:14 Splash-Screen
+00:00:27 Warning
+…
+00:08:05 Sleepless in Seattle: MOVIE BEGIN
+…
+01:45:11 End Titles
+01:48:47 END
+
+  6) -a ADD “$CHAPTER” to bottom of “$MDATA”
+note:
+     • the python script “$CONVERT” is used to transform the single-line start-time +
+       title entries in “$CHAPTER” into mp4 METADATA
+     • “$CONVERT” will be auto-created if it does not already exist in the mp4 directory
+
+After -a ADD the above example becomes (note that last 'chapter' has gone):
+[CHAPTER]
+TIMEBASE=1/1000
+START=14000
+END=26999
+title=Splash-Screen
+
+[CHAPTER]
+TIMEBASE=1/1000
+START=27000
+END=77999
+title=Warning
+…
+[CHAPTER]
+TIMEBASE=1/1000
+START=485000
+END=695999
+title=Sleepless in Seattle: MOVIE BEGIN
+…
+[CHAPTER]
+TIMEBASE=1/1000
+START=6311000
+END=6526999
+title=End Titles
+
+  7) -i IMPORT “$MDATA” to original mp4
+
+note:
+     • “-c copy” means it takes seconds to process hours-long videos
+     • Although -i IMPORT contains “-force_key_frames chapters-0.1”
+       within the FFMPEG line to add KeyFrames at each Chapter,
+       it is ineffective due to presence of “-c copy”. Remove
+       “-c copy” if you want KF at each Chapter (but realise that
+       it will then take hours to process every frame in the file).
+
+EOF
+} # HELP()
+
+CECHO ()                 # echo in magenta
+{
+black='\E[30;47m'
+red='\E[31;47m'
+green='\E[32;47m'
+yellow='\E[33;47m'
+blue='\E[34;47m'
+magenta='\E[35;40m'      # magenta foreground, white background
+cyan='\E[36;47m'
+white='\E[37;47m'
+
+echo -en "$magenta"
+echo -n "${1}"           # no newline
+Reset
+
+return
+} # CECHO ()
+
+CONVERTER ()
+{
+cat > "$DIR/$CONVERT" << EOF
+#  $CONVERT
+#  A python script to convert lines of plain-text
+#+ to groupings of text suitable to import as mp4 Chapters.
+#
+#  helper.py expects to reside within the same directory as
+#+ chapters.txt + FFMETADATAFILE and should be launched from that dir.
+#
+#  Each line in “chapters.txt” should have the format:
+#+ “<hh:mm:ss><single-space><Chapter-Title>” (no quotes nor
+#+ brackets). The file should end with a dummy “END” chapter
+#+ (the filetime for that chapter allows an end-time to be
+#+ computed for the actual last chapter).
+#
+#  The Metadata keys or values containing special characters
+#+ (‘=’, ‘;’, ‘#’, ‘\’ and a newline) must be escaped with a
+#+ backslash ‘\’; this applies to each Chapter-Title.
+#
+# 2021-10-23 Basic error-checking for start + end added
+# 2021-11-01 Format error-checking added
+
+import re
+
+chapters = list()
+
+with open('chapters.txt', 'r') as f:
+   for line in f:
+      x = re.match(r"(\d{2}):(\d{2}):(\d{2}) (.*)", line)
+      try:
+        hrs = int(x.group(1))
+        mins = int(x.group(2))
+        secs = int(x.group(3))
+        title = x.group(4)
+      except AttributeError:
+        print("Bad format on line “" + line + "”")
+        raise
+ 
+      minutes = (hrs * 60) + mins
+      seconds = secs + (minutes * 60)
+      timestamp = (seconds * 1000)
+      chap = {
+         "title": title,
+         "startTime": timestamp
+      }
+      chapters.append(chap)
+
+text = ""
+
+for i in range(len(chapters)-1):
+   chap = chapters[i]
+   title = chap['title']
+   start = chap['startTime']
+   end = chapters[i+1]['startTime']-1
+   assert (end>start), "For “" + title + "” a time is wrong"
+   text += f"""
+[CHAPTER]
+TIMEBASE=1/1000
+START={start}
+END={end}
+title={title}
+"""
+
+with open("FFMETADATAFILE", "a") as myfile:
+    myfile.write(text)
+EOF
+} # CONVERTER()
+
+# show HELP if no input OR first param is "-h" OR "-H"
+if [ -z "$1" ]; then
+  CECHO "!Fatal Error!"; echo " No MP4NAME in command."
+  HELP
+  exit 2
+else if [[ "$1" == "-h" || "$1" == "-H" ]]; then
+  HELP
+  exit
+else
+  MP4NAME="$1"
+  # 'shift' moves all positional parameters down by one
+  shift
+fi fi
+
+# there must be just one parameter left
+if [ -z "$1" ]; then
+  CECHO "!Fatal Error!"; echo "'ACTION' parameter is missing"
+  HELP
+  exit 2
+else
+  # set default parameter
+  ACTION=e
+fi
+
+# set $DIR + $FN + $MP4, and check for file existence
+MP4="${MP4NAME##*/}";  # parameter expansion to basename; see https://tldp.org/LDP/abs/html/refcards.html#AEN22828
+DIR="${MP4NAME%/*}";   # parameter expansion to directory
+if [ "$MP4" = "$DIR" ]; then
+  # no path provided with mp4 filename
+  # try to provide it
+  DIR="$PWD"
+  if [ -z "$DIR" ]; then
+    CECHO "!Fatal Error!"; echo " The mp4 filename was provided without a directory-path, and \$PWD is empty";
+    echo -n "Please add the directory path to the mp4 filename and try again."
+  echo "$HELP_SHORT"
+  exit 2
+  fi
+fi
+FN="${MP4%.*}";        # basename without '.mp4' extension
+UPDATE="$FN-chapters.mp4";
+if [ ! -f "$DIR/$MP4" ]; then
+  CECHO "!Fatal Error!"; echo -n " Cannot find ‘"; CECHO "$MP4"; echo -n "’ in ‘"; CECHO "$DIR"; echo "’."
+  exit 2
+fi
+
+# which ACTION?
+#while [ $# -gt 0 ]; do # ’til we run out of parameters…
+  case "$1" in
+    a|A|-a|-A|--add|--ADD)       ACTION=a;;
+    c|C|-c|-C|--create|--CREATE) ACTION=c;;
+    e|E|-e|-E|--export|--EXPORT) ACTION=e;;
+    i|I|-i|-I|--import|--IMPORT) ACTION=i;;
+    h|H|-h|-H|--help|--HELP)     HELP; exit 0;;
+    *) CECHO "Unknown parameter/error while processing options"; echo; HELP; exit 2;;
+  esac
+#shift       # check next parameter
+#done        # only one parameter to check
+
+# act on the $ACTION
+case "$ACTION" in
+  a)
+   # ADD
+   #---------------------------------------------------------
+   # add chapter metadata from CHAPTER to MDATA using CONVERT
+   echo "This ADD routine converts the contents of the text-file ‘$CHAPTER’ into metadata suitable to add to a MP4 file + appends it to ‘$MDATA’. Note that python3 needs to be pre-installed on your system.";
+   # 1. check for installation of python3
+   echo "1) Checking for installation of python3 in the system …";
+   if python3 --version; then
+     echo "python3 is installed";
+   else
+     CECHO "!Fatal Error!"; echo " python3 is NOT installed.  Exiting now.";
+     exit 2
+   fi
+   # 2. check for existence of CONVERT in DIR
+   echo "2) Checking for existence of python script-file ‘$CONVERT’…";
+   if [ -f "$DIR/$CONVERT" ]; then
+     echo "File ‘$CONVERT’ exists."
+     file -i "$DIR/$CONVERT"
+   else
+     CECHO "!Fatal Error!"; echo " File ‘$CONVERT’ is missing. We shall auto-create it (hold my jacket) …"
+     echo -n "◦ Creating script-file “"; CECHO "$CONVERT"; echo -n "” in “"; CECHO "$DIR"; echo "” (plain-text utf8 file, same dir as mp4)."
+     CONVERTER;
+     chmod +x "$DIR/$CONVERT";
+     ls -l "$DIR/$CONVERT";
+   fi
+   # 3. check for existence of MDATA in DIR
+   echo "3) Checking for existence of plain-text file ‘$MDATA’…";
+   if [ -f "$DIR/$MDATA" ]; then
+     echo "File ‘$MDATA’ exists."
+     file -i "$DIR/$MDATA"
+   else
+     CECHO "!Fatal Error!"; echo " File ‘$MDATA’ is missing. Use EXPORT to export ‘$MDATA’ from the mp4";
+     exit 2
+   fi
+   # 4. check for existence of CHAPTER (that is NOT empty) in DIR
+   echo "4) Checking for existence of plain-text file ‘$CHAPTER’ (this needs to be manually created by yourself) …";
+   if [ -f "$DIR/$CHAPTER" ]; then
+     z=`cat "$DIR/$CHAPTER" | wc -l`; n=0; let z=z+n; # integer arithmetic
+     if [ $z -gt $n ]; then
+       echo "File ‘$CHAPTER’ exists & contains $z chapter-lines."
+       file -i "$DIR/$CHAPTER"
+     else
+       CECHO "!Fatal Error!"; echo "File ‘$CHAPTER’ exists but contains $n chapter-lines.";
+       echo "You need to add each start-time & title for each Chapter into ‘$CHAPTER’ by hand.";
+       echo "A tedious business, but if YOU do not do it who will?  Exiting now.";
+       exit 2;
+     fi
+   else
+     CECHO "!Fatal Error!"; echo " File ‘$CHAPTER’ is missing.";
+     echo "‘$CHAPTER’ is a plain-text listing of start-times + Title of each Chapter in the mp4. Refer to the HELP for further help. There is also assistance near the top of ‘$CONVERT’.";
+     exit 2;
+   fi
+   # 5. check for existing chapters in MDATA
+   echo "5) Checking for any existing Chapters within ‘$MDATA’ …";
+   z=$(awk '$1 ~ /\[CHAPTER\]/ {++c} END {print c}' FS=: "$DIR/$MDATA");
+   if [ -z "$z" ]; then
+     n=0; z=0;       # $z was empty
+   else
+     n=0; let z=z+n; # integer arithmetic
+   fi
+   if [ $z -gt $n ]; then
+     echo "$MDATA has $z Chapters";
+     CECHO "!Fatal Error!"; echo " File ‘$MDATA’ already contains Chapters. Exiting now.";
+     exit 2;
+   else
+     echo "$MDATA has no Chapters";
+   fi;
+   # add CHAPTER to MDATA
+   cd "$DIR";
+   echo -n "◦ Adding all Metadata from “"; CECHO "$CHAPTER"; echo -n "” to the bottom of “"; CECHO "$MDATA"; echo "”."
+   ls -l "$DIR/$MDATA";
+   if python3 "$CONVERT"; then
+     echo "Success adding Chapters to “$MDATA”"
+   else
+     CECHO "Adding Chapters failed. "; echo "Exiting… (Check the Error message(s))"
+     exit 2
+   fi
+   ls -l "$DIR/$MDATA";
+   echo "◦ Action complete."
+   echo "◦ The final act now is to IMPORT “$MDATA” into “$MP4”. Exiting now.";
+   exit 0;
+   ;;
+  c)
+   # CREATE
+   #---------------------------------------------------------
+   # create CONVERT in MP4NAME directory
+   echo "This CREATE routine creates the python script “$CONVERT” within ‘$DIR’. Note that python3 needs to be pre-installed on your system, whilst $CONVERT must NOT already exist.";
+   # 1. check for installation of python3
+   echo "1) Checking for installation of python3 in the system …";
+   if python3 --version; then
+     echo "python3 is installed";
+   else
+     CECHO "!Error!"; echo " python3 is NOT installed. Exiting now.";
+     exit 2
+   fi
+   # 2. now check for pre-existence of CONVERT in DIR
+   echo "2) Checking for “$CONVERT” in ‘$DIR’ …";
+   if [ -f "$DIR/$CONVERT" ]; then
+     CECHO "!Fatal Error!"; echo -n " File ‘$CONVERT’ already exists."; echo "Please move/rename (and/or) delete the existing “$CONVERT” and run CREATE again.";
+     file -i "$DIR/$CONVERT"
+     echo "Exiting now.";
+     exit 2
+   fi
+   # do the creation
+   echo -n "◦ Creating script-file “"; CECHO "$CONVERT"; echo -n "” in “"; CECHO "$DIR"; echo "” (plain-text utf8 file, same dir as mp4)."
+   CONVERTER;
+   chmod +x "$DIR/$CONVERT";
+   ls -l "$DIR/$CONVERT";
+   file -i "$DIR/$CONVERT"
+   exit 0;
+   ;;
+  e)
+   # EXPORT
+   #---------------------------------------------------------
+   # export MDATA from MP4NAME into same directory
+   echo "This EXPORT routine exports the metadata from $MP4 into a plain-text file $MDATA within the same directory. Note that ffmpeg needs to be pre-installed on your system, whilst $MDATA must NOT already exist.";
+   # 1. check for installation of ffmpeg
+   echo "1) Checking for installation of ffmpeg in the system …";
+   # ffmpeg shows banner here even with hide_banner
+   if ffmpeg -version | head -n 1; then
+     echo "ffmpeg is installed";
+   else
+     CECHO "!Fatal Error!"; echo " ffmpeg is NOT installed. Exiting now.";
+     exit 2
+   fi
+   # 2. now check for existence of previous MDATA in DIR
+   echo "2) Checking for “$MDATA” in ‘$DIR’ …";
+   if [ -f "$DIR/$MDATA" ]; then
+     CECHO "!Fatal Error!"; echo " File ‘$MDATA’ already exists."; echo "Please move/rename (and/or) delete the existing “$MDATA” and run EXPORT again."
+     exit 2
+   fi
+   # 3. do the export
+   echo -n "◦ Exporting all Metadata from “"; CECHO "$MP4NAME"; echo -n "” into new file “"; CECHO "$MDATA"; echo "” (plain-text utf8 file, same dir as mp4).";
+   if ffmpeg -i "$MP4NAME" -f ffmetadata "$DIR/$MDATA"; then
+     echo -n "Success creating “"; CECHO "$MDATA"; echo "”.";
+     echo "◦ Global title, artist (Director) + date (etc.) can be added to “$MDATA”.";
+     echo "◦ (for more see: https://roundup.ffmpeg.org/doxygen/3.2/group__metadata__api.html)";
+     echo "◦ Next, create a file “$CHAPTER” (same dir) containing times + chapters (see Help for format).";
+     echo "◦ Next, ADD “$CHAPTER” to "$MDATA".";
+     echo "◦ Finally, IMPORT “$MDATA” back into “$MP4” (new file; the original mp4 will be left unchanged).";
+     echo "◦ Exiting now.";
+     exit 0;
+   else
+     echo -n "Error whilst creating “"; CECHO "$MDATA"; echo "”. See Error message above";
+     exit 2
+   fi
+   ;;
+  i)
+   # IMPORT
+   #---------------------------------------------------------
+   # import MDATA into MP4NAME
+   echo "This IMPORT routine is the culmination of this BASH file. It imports $MDATA into $MP4 within $DIR as $UPDATE. Note that ffmpeg needs to be pre-installed on your system, whilst $MDATA must contain at least one Chapter, and the new mp4 must NOT pre-exist.";
+   # 1. check for installation of ffmpeg
+   echo "1) Checking for installation of ffmpeg in the system …";
+   # ffmpeg shows banner here even with hide_banner
+   if ffmpeg -version | head -n 1; then
+     echo "ffmpeg is installed";
+   else
+     CECHO "!Fatal Error!"; echo " ffmpeg is NOT installed. Exiting now.";
+     exit 2
+   fi
+   # 2. check for existing chapters in MDATA
+   echo "2) Checking that $MDATA contains at least one Chapter …";
+   z=$(awk '$1 ~ /\[CHAPTER\]/ {++c} END {print c}' FS=: "$DIR/$MDATA");
+   if [ -z "$z" ]; then
+     n=0; z=0;       # $z was empty
+   else
+     n=0; let z=z+n; # integer arithmetic
+   fi
+   if [ $z -gt $n ]; then
+     echo "$MDATA has $z Chapters";
+   else
+     CECHO "!Fatal Error!"; echo " File ‘$MDATA’ has no Chapters. Exiting now.";
+     exit 2
+   fi
+   # 3. now check for existence of previous UPDATE in DIR
+   echo "3) Checking for “$UPDATE” in ‘$DIR’ …";
+   if [ -f "$DIR/$UPDATE" ]; then
+     CECHO "!Fatal Error!"; echo " File ‘$UPDATE’ already exists."; echo "Please move/rename (and/or) delete the existing “$UPDATE” and run IMPORT again."
+     exit 2
+   else
+     echo "‘$UPDATE’ does NOT yet exist, so we shall now create it.";
+   fi
+   # 4. now import the metadata into the mp4
+   echo -n "◦ Importing all Metadata within “"; CECHO "$MDATA"; echo -n "” into “"; CECHO "$MP4"; echo "”."
+   # belt 'n' braces:
+   # faststart puts the moov atom at file-start (essential if streamed):
+   # -force_key_frames chapters-0.1 puts a keyframe just before each Chapter
+   # see http://ffmpeg.org/ffmpeg.html#Advanced-Video-options
+   ffmpeg -i "$DIR/$MP4" -i "$DIR/$MDATA" -map_metadata 1 -map_chapters 1 -force_key_frames chapters-0.1 -movflags faststart -c copy "$DIR/$UPDATE"
+   echo -n "◦ The updated mp4 is called “"; CECHO "$UPDATE"; echo "”, whilst the original is unchanged."
+   exit 0;
+   ;;
+esac
