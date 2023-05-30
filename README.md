@@ -17,7 +17,7 @@ The following will assume that you have created a dir `~/.local/sbin` within whi
 ```bash
 $ chmod 0700 ~/.local/sbin/add_chapters
 $ la ~/.local/sbin/add_chapters
--rwx------ 1 user user 17461 Nov 20  2021 /home/alexk/.local/sbin/add_chapters
+-rwx------ 1 user user 17461 Nov 20  2021 /home/user/.local/sbin/add_chapters
 ```
 ## *Help*
 Attempting to run the bare script with zero parameters shows an extended Help message:
