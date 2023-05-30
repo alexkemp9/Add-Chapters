@@ -9,6 +9,8 @@ The script advises you to export all current MetaData from the video-file into a
 
 The Python script (called *“helper.py”* by default) is embedded within `add_chapters` and will be exported into the same dir as the MP4 file if not already existing.
 
+After all preparation, the final act is to transfer all chapters from *FFMETADATAFILE* into the MP4.
+
 ## *Begin*
 The following will assume that you have created a dir `~/.local/sbin` within which you store the bash-file; this is to set the script as executable for current user only:
 
